@@ -4,10 +4,11 @@
 `%||%` <- function(a, b) if (is.null(a) || !length(a)) b else a
 
 # MDPI journal metadata and FLCA explorer — reconstructed application shell.
-required <- c("shiny", "readr", "dplyr", "ggplot2", "tibble")
+required <- c("shiny", "readr", "dplyr", "ggplot2", "tibble", "httr", "jsonlite", "ggrepel")
 missing <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
 if (length(missing)) stop("Install required packages: ", paste(missing, collapse = ", "), call. = FALSE)
 suppressPackageStartupMessages({ library(shiny); library(readr); library(dplyr); library(ggplot2); library(tibble) })
+source("openalex_author_mode.R", local = TRUE)
 
 metadata_path <- "Metrics_MDPI_metadata.csv"
 keyword_cache_path <- "Metrics_DOI_author_keywords.csv"
@@ -218,11 +219,14 @@ cooccurrence <- function(term_sets, top_n = 20) {
   list(nodes = tibble(term = nodes, frequency = as.integer(singles)), edges = tibble(from = vapply(edge_split, `[`, "", 1), to = vapply(edge_split, `[`, "", 2), weight = as.integer(edge_tab)))
 }
 
-flca_entity_tab <- function(id, title) tabPanel(title,
+flca_visual_tabs <- function(id) {
   tabsetPanel(
     tabPanel("Top-20 node counts", tableOutput(paste0(id, "_nodes"))),
-        tabPanel("Full network", plotOutput(paste0(id, "_full"), height = "650px")),
-    tabPanel("Reduced network", plotOutput(paste0(id, "_reduced"), height = "650px")),
+    tabPanel("Full network", plotOutput(paste0(id, "_full"), height = "650px")),
+    tabPanel("Reduced network", p("Arrow width is proportional to WCD; edge labels show the exact WCD."), plotOutput(paste0(id, "_reduced"), height = "650px")),
+    tabPanel("Dendrograph",
+      p("All FLCA nodes are aligned along the baseline, with occurrence counts below their names. A solid red stem marks each leader up to its own horizontal join. Grey follower stems show incoming WCD links, with width proportional to WCD and exact values labeled; bubble area reflects node value. The highest-count node has a red name. Disconnected components have dashed stems to the top reference line."),
+      plotOutput(paste0(id, "_dendrogram"), height = "900px")),
     tabPanel("Sankey plot", plotOutput(paste0(id, "_sankey"), height = "650px")),
     tabPanel("Chord plot", plotOutput(paste0(id, "_chord"), height = "650px")),
     tabPanel("SSPlot", plotOutput(paste0(id, "_ss"), height = "900px")),
@@ -230,7 +234,9 @@ flca_entity_tab <- function(id, title) tabPanel(title,
     tabPanel("Slope plot", plotOutput(paste0(id, "_slope"), height = "900px")),
     tabPanel("Top-20 cluster table", tableOutput(paste0(id, "_clusters")), tableOutput(paste0(id, "_edges")))
   )
-)
+}
+
+flca_entity_tab <- function(id, title) tabPanel(title, flca_visual_tabs(id))
 
 summary_h <- function(x) { x <- sort(as.numeric(x[is.finite(x)]), decreasing=TRUE); if(!length(x)) return(0L); sum(x >= seq_along(x)) }
 summary_aac <- function(counts) {
@@ -279,7 +285,16 @@ draw_summary_report <- function(summary_df, n_articles = NA_integer_, dataset_h 
 
 ui <- fluidPage(
   titlePanel("MDPI Journal Metadata & FLCA Explorer"),
-  tags$head(tags$style(HTML(".flca-entity-heading { font-weight: 700; color: #1f4e79; margin-top: 14px; } .tab-content { overflow-x: auto; }"))),
+  tags$head(tags$style(HTML("
+    .flca-entity-heading { font-weight: 700; color: #1f4e79; margin-top: 14px; }
+    .tab-content { overflow-x: auto; }
+    #main_tabs > li.active > a, #main_tabs > li.active > a:hover, #main_tabs > li.active > a:focus,
+    #entity_tabs > li.active > a, #entity_tabs > li.active > a:hover, #entity_tabs > li.active > a:focus {
+      color: #c00000 !important;
+      font-weight: 700;
+    }
+    .author-mode-heading { color: #c00000; font-weight: 700; }
+  "))),
   sidebarLayout(
     sidebarPanel(width = 3,
       textInput("issn", "MDPI Journal ISSN", value = "3042-5042", placeholder = "e.g., 3042-5042"),
@@ -309,7 +324,12 @@ ui <- fluidPage(
       tags$hr(), tags$h4("F. Graphical abstract"),
       textAreaInput("article_content", "Article content (authors are ignored)", value = default_article_content, rows = 9),
       fluidRow(column(7, actionButton("extract_article_content", "Extract keywords", class = "btn-success btn-block")), column(5, actionButton("clear_article_content", "Clear content", class = "btn-default btn-block"))),
-      sliderInput("graphical_phrase_min", "Minimum keyphrase occurrences", min = 1, max = 10, value = 2, step = 1)
+      sliderInput("graphical_phrase_min", "Minimum keyphrase occurrences", min = 1, max = 10, value = 2, step = 1),
+      tags$hr(), tags$h4(class = "author-mode-heading", "5. Author publications and coauthorship"),
+      textInput("openalex_author_name", "Author name", value = "Tsair-Wei Chien"),
+      passwordInput("openalex_api_key", "OpenAlex API key for author search"),
+      actionButton("search_openalex", "Search OpenAlex", class = "btn-primary btn-block"),
+      helpText("Select the correct author profile in the OpenAlex authors tab. Mode 5 analyses first and last authors of its works.")
     ),
     mainPanel(width = 9,
       tabsetPanel(id = "main_tabs",
@@ -325,12 +345,23 @@ ui <- fluidPage(
         tabPanel("FLCA Process",
           h3("FLCA Process: co-occurrence by metadata entity"),
           textOutput("flca_status"), br(),
-          tabsetPanel(id = "entity_tabs",
-            flca_entity_tab("authors", "Authors"),
-            flca_entity_tab("keywords", "Keywords"),
-            flca_entity_tab("countries", "Countries"),
-            flca_entity_tab("institutes", "Institutes"),
-            flca_entity_tab("departments", "Departments")
+          wellPanel(
+            h4("Metadata domains"),
+            tabsetPanel(id = "entity_tabs",
+              tabPanel("Authors", value = "authors"),
+              tabPanel("Keywords", value = "keywords"),
+              tabPanel("Countries", value = "countries"),
+              tabPanel("Institutes", value = "institutes"),
+              tabPanel("Departments", value = "departments")
+            )
+          ),
+          wellPanel(
+            h4("Visualizations"),
+            conditionalPanel("input.entity_tabs == 'authors'", flca_visual_tabs("authors")),
+            conditionalPanel("input.entity_tabs == 'keywords'", flca_visual_tabs("keywords")),
+            conditionalPanel("input.entity_tabs == 'countries'", flca_visual_tabs("countries")),
+            conditionalPanel("input.entity_tabs == 'institutes'", flca_visual_tabs("institutes")),
+            conditionalPanel("input.entity_tabs == 'departments'", flca_visual_tabs("departments"))
           )
         ),
         tabPanel("Reference journal trends",
@@ -354,6 +385,27 @@ ui <- fluidPage(
           downloadButton("download_summary", "Download summary CSV"), downloadButton("download_summary_png", "Download summary PNG"), br(), br(),
           plotOutput("summary_report", height = "1600px"), br(),
           tableOutput("summary_table")
+        ),
+        tabPanel("OpenAlex authors",
+          h3("Author publications and coauthorship"),
+          textOutput("openalex_author_status"),
+          selectInput("openalex_author_id", "OpenAlex author profile", choices = character()),
+          uiOutput("openalex_profile_link"),
+          h4("Matching author profiles"), tableOutput("openalex_candidates"),
+          h4("First/last-author FLCA network"),
+          p("Each work links its first and last authors. Node size shows first/last-author work count; edge width shows the number of shared works."),
+          plotOutput("openalex_network", height = "700px"),
+          h4("First/last-author Kano plot"),
+          p("FLCA selects up to 20 nodes. The Kano plot uses first/last-author edge occurrences on x, first/last-author work count on y, and SHC (1 − Burt constraint) for bubble size."),
+          plotOutput("openalex_kano", height = "760px"),
+          h4("First/last-author FLCA dendrograph"),
+          p("The same metadata FLCA dendrograph style is used here: red leader stems, grey follower stems scaled by WCD with exact values, and dashed grey stems for components without a path to the top leader. Bubbles align at the baseline; labels and counts appear below."),
+          textOutput("openalex_dendrogram_status"),
+          plotOutput("openalex_dendrogram", height = "850px"),
+          h4("FLCA node measures"), tableOutput("openalex_node_measures"),
+          h4("Coauthors"), tableOutput("openalex_coauthors"),
+          h4("Recent publications"), tableOutput("openalex_publications"),
+          downloadButton("download_openalex_publications", "Download retrieved publications CSV")
         ),
         tabPanel("ReadMe",
           h3("How to use this app"),
@@ -507,13 +559,157 @@ observeEvent(input$extract_article_content, {
     }, error = function(e) structure(list(message = e$message), class = "flca_error"))
   }
   draw_message <- function(message) { plot.new(); text(.5, .5, message, cex = 1.1) }
+  flca_display_edges <- function(result) {
+    nodes <- as.character(result$modes$name)
+    edges <- as.data.frame(result$data)
+    if (!nrow(edges)) return(edges)
+    edges$WCD <- suppressWarnings(as.numeric(edges$WCD))
+    edges <- edges[is.finite(edges$WCD) & edges$WCD > 0 &
+      edges$Leader %in% nodes & edges$Follower %in% nodes &
+      edges$Leader != edges$Follower, , drop = FALSE]
+    edges <- edges[order(-edges$WCD, edges$Leader, edges$Follower), , drop = FALSE]
+    edges[!duplicated(edges$Follower), , drop = FALSE]
+  }
+  draw_wcd_label <- function(x, y, wcd, cex = .85) {
+    label <- sprintf("%.2f", wcd)
+    half_w <- strwidth(label, cex = cex, font = 2) / 2 + strwidth(" ", cex = cex)
+    half_h <- strheight(label, cex = cex, font = 2) / 2 + strheight(" ", cex = cex) / 3
+    rect(x - half_w, y - half_h, x + half_w, y + half_h, col = "white", border = NA)
+    text(x, y, label, cex = cex, font = 2, col = "#333333")
+  }
   draw_reduced <- function(result, title) {
     if (is.null(result) || inherits(result, "flca_error")) return(draw_message(if (is.null(result)) "Not enough co-occurrences for FLCA." else result$message))
-    nd <- result$modes; ed <- result$data; n <- nrow(nd); th <- seq(0, 2*pi, length.out=n+1)[-(n+1)]; xy <- data.frame(name=nd$name,x=cos(th),y=sin(th),carac=as.factor(nd$carac),value=nd$value)
+    nd <- result$modes; ed <- flca_display_edges(result); n <- nrow(nd); th <- seq(0, 2*pi, length.out=n+1)[-(n+1)]; xy <- data.frame(name=nd$name,x=cos(th),y=sin(th),carac=as.factor(nd$carac),value=nd$value)
     plot(xy$x,xy$y,type="n",xlim=c(-1.35,1.35),ylim=c(-1.35,1.35),axes=FALSE,xlab="",ylab="",main=title,font.main=2)
     pal <- grDevices::hcl.colors(max(3,length(unique(xy$carac))),"Dark 3"); cols <- setNames(pal,sort(unique(xy$carac)))
-    if(nrow(ed)) for(i in seq_len(nrow(ed))){a<-xy[match(ed$Leader,xy$name),];b<-xy[match(ed$Follower,xy$name),];segments(a$x,a$y,b$x,b$y,col="grey65",lwd=1+log1p(ed$WCD[i]))}
+    if(nrow(ed)) for(i in seq_len(nrow(ed))){a<-xy[match(ed$Leader[i],xy$name),];b<-xy[match(ed$Follower[i],xy$name),];arrows(a$x,a$y,.9*b$x+.1*a$x,.9*b$y+.1*a$y,length=.08,angle=20,col="grey65",lwd=1+5*ed$WCD[i]/max(ed$WCD))}
     points(xy$x,xy$y,pch=21,bg=cols[as.character(xy$carac)],cex=1.5+2*xy$value/max(xy$value),col="grey10"); text(xy$x,xy$y,xy$name,cex=1.05,font=2)
+    if(nrow(ed)) for(i in seq_len(nrow(ed))){a<-xy[match(ed$Leader[i],xy$name),];b<-xy[match(ed$Follower[i],xy$name),];draw_wcd_label(.55*a$x+.45*b$x,.55*a$y+.45*b$y,ed$WCD[i])}
+  }
+  draw_flca_dendrogram <- function(result, net, title, label_map = NULL,
+                                  highlight_id = NULL) {
+    if (is.null(result) || inherits(result, "flca_error") || nrow(result$modes) < 1L)
+      return(draw_message("No FLCA nodes are available for a dendrograph."))
+    nodes <- as.data.frame(result$modes)
+    labels <- as.character(nodes$name)
+    display_labels <- labels
+    if (!is.null(label_map)) {
+      mapped <- unname(label_map[labels])
+      use <- !is.na(mapped) & nzchar(mapped)
+      display_labels[use] <- mapped[use]
+    }
+    edges <- flca_display_edges(result)
+    roots <- setdiff(labels, edges$Follower)
+    if (!length(roots)) return(draw_message("The FLCA links contain a cycle, so a dendrograph cannot be drawn."))
+    children <- split(as.character(edges$Follower), as.character(edges$Leader))
+    positions <- setNames(rep(NA_real_, length(labels)), labels)
+    visited <- character()
+    next_x <- 0
+    place <- function(node) {
+      if (node %in% visited) return(invisible(NULL))
+      visited <<- c(visited, node)
+      offspring <- children[[node]]
+      left_n <- floor(length(offspring) / 2)
+      if (left_n) for (child in offspring[seq_len(left_n)]) place(child)
+      next_x <<- next_x + 1
+      positions[node] <<- next_x
+      if (left_n < length(offspring))
+        for (child in offspring[seq.int(left_n + 1L, length(offspring))]) place(child)
+      invisible(NULL)
+    }
+    for (root in roots) {
+      if (length(visited)) next_x <- next_x + .55
+      place(root)
+    }
+    if (length(visited) != length(labels))
+      return(draw_message("The FLCA links contain a cycle, so a dendrograph cannot be drawn."))
+    max_wcd <- if (nrow(edges)) max(edges$WCD) else 1
+    leader_level <- setNames(rep(0, length(labels)), labels)
+    set_level <- function(node) {
+      offspring <- children[[node]]
+      if (!length(offspring)) return(0)
+      leader_level[node] <<- 1 + max(vapply(offspring, set_level, numeric(1)))
+      leader_level[node]
+    }
+    for (root in roots) set_level(root)
+    top_height <- max(c(1, leader_level))
+    values <- suppressWarnings(as.numeric(nodes$value))
+    values[!is.finite(values) | values <= 0] <- 1
+    bubble_cex <- 3 * sqrt(values / max(values))
+    occurrence_counts <- suppressWarnings(as.numeric(nodes$value))
+    count_labels <- ifelse(is.finite(occurrence_counts),
+                           format(occurrence_counts, trim = TRUE, scientific = FALSE), "NA")
+    counts <- net$nodes$frequency[match(labels, net$nodes$term)]
+    counts[!is.finite(counts)] <- -Inf
+    top_node <- if (!is.null(highlight_id) && highlight_id %in% labels)
+      highlight_id else labels[order(-counts, labels)][1]
+    parent <- setNames(as.character(edges$Leader), as.character(edges$Follower))
+    root_of <- function(node) {
+      while (node %in% names(parent)) node <- parent[[node]]
+      node
+    }
+    top_root <- root_of(top_node)
+    other_roots <- setdiff(roots, top_root)
+    show_reference <- length(other_roots) > 0L || top_node != top_root
+    top_reference <- if (show_reference) top_height + .6 else top_height
+    cluster_ids <- sort(unique(as.character(nodes$carac)))
+    colours <- setNames(grDevices::hcl.colors(max(3L, length(cluster_ids)), "Dark 3")[seq_along(cluster_ids)], cluster_ids)
+    old_par <- par(no.readonly = TRUE)
+    on.exit(par(old_par), add = TRUE)
+    par(mar = c(3, 4, 4, 2), xpd = NA)
+    name_cex <- if (length(labels) >= 15L) .68 else .78
+    longest_name_in <- max(strwidth(display_labels, units = "inches", cex = name_cex, font = 2))
+    plot_height_in <- par("pin")[2]
+    bottom_in <- longest_name_in + 1.2
+    upper_y <- top_reference + .55
+    units_per_in <- upper_y / (plot_height_in - bottom_in)
+    lower_y <- -bottom_in * units_per_in
+    name_y <- -.16 * units_per_in
+    count_y <- -(longest_name_in + .85) * units_per_in
+    plot(NA, xlim = c(.15, max(positions) + .85),
+         ylim = c(lower_y, upper_y), axes = FALSE, xlab = "", ylab = "",
+         main = sprintf("%s: strongest-link FLCA dendrograph of %d nodes", title, length(labels)), font.main = 2)
+    segments(.35, 0, .35, top_reference, col = "grey30", lwd = 1.2)
+    if (show_reference) {
+      segments(min(positions), top_reference, max(positions), top_reference,
+               col = "grey70", lwd = 1.5)
+    }
+    if (nrow(edges)) {
+      for (leader in unique(as.character(edges$Leader))) {
+        followers <- as.character(edges$Follower[edges$Leader == leader])
+        level <- leader_level[leader]
+        segments(positions[leader], 0, positions[leader], level,
+                 col = "#C00000", lwd = 2.5)
+        segments(min(positions[c(leader, followers)]), level,
+                 max(positions[c(leader, followers)]), level,
+                 col = "grey55", lwd = 1.5)
+      }
+      for (i in seq_len(nrow(edges))) {
+        leader <- as.character(edges$Leader[i])
+        follower <- as.character(edges$Follower[i])
+        width <- 1 + 5 * edges$WCD[i] / max_wcd
+        segments(positions[follower], leader_level[follower], positions[follower], leader_level[leader],
+                 col = "grey55", lwd = width)
+        draw_wcd_label(positions[follower],
+                       (leader_level[follower] + leader_level[leader]) / 2,
+                       edges$WCD[i], cex = .72)
+      }
+    }
+    if (show_reference)
+      segments(positions[top_node], 0, positions[top_node], top_reference,
+               col = "#C00000", lwd = 2.5)
+    for (root in other_roots)
+      segments(positions[root], leader_level[root], positions[root], top_reference,
+               col = "grey75", lty = 2, lwd = 1.5)
+    points(unname(positions[labels]), rep(0, length(labels)), pch = 21,
+           cex = bubble_cex, bg = unname(colours[as.character(nodes$carac)]), col = "grey20")
+    text(unname(positions[labels]), rep(name_y, length(labels)), display_labels,
+         srt = 90, adj = c(1, .5), cex = name_cex,
+         font = 2, col = ifelse(labels == top_node, "red", "black"))
+    text(unname(positions[labels]), rep(count_y, length(labels)), count_labels,
+         srt = 90, adj = c(1, .5), cex = .78, font = 2,
+         col = ifelse(labels == top_node, "red", "black"))
+    mtext("Red stems: leader role; grey follower stems: WCD; dashed upper stems: no path to top node", side = 1, line = .5, cex = .82)
   }
   draw_sankey <- function(result, title) {
     if (is.null(result) || inherits(result, "flca_error")) return(draw_message("Not enough FLCA links for Sankey plot."))
@@ -564,6 +760,7 @@ observeEvent(input$extract_article_content, {
     output[[paste0(id,"_nodes")]] <- renderTable({ n <- net()$nodes; if (!nrow(n)) return(data.frame(Status = "No terms available.")); names(n) <- c("Node", "Count"); n }, striped = TRUE, bordered = TRUE)
     output[[paste0(id,"_full")]] <- renderPlot(draw_network(net(), paste(label,"full co-occurrence network")))
     output[[paste0(id,"_reduced")]] <- renderPlot(draw_reduced(real(), paste(label,"real FLCA Top-20 reduced network")))
+    output[[paste0(id,"_dendrogram")]] <- renderPlot(draw_flca_dendrogram(real(), net(), label), width = 1100, height = 900, res = 110)
     output[[paste0(id,"_sankey")]] <- renderPlot(draw_sankey(real(), paste(label,"FLCA Sankey plot")))
     output[[paste0(id,"_chord")]] <- renderPlot(draw_chord(real(), paste(label,"FLCA chord plot")))
     output[[paste0(id,"_ss")]] <- renderPlot({ r<-real(); if(is.null(r)||inherits(r,"flca_error")) draw_message("Not enough data for SSPlot.") else { source("renderSSplot.R",local=TRUE); s<-r$modes; s$sil_width<-s$ssi; render_panel(s,make_nodes0(s),results=make_ss_results(r),nodes=s,top_n=min(20,nrow(s)),font_scale=1.15) } })
@@ -579,6 +776,240 @@ observeEvent(input$extract_article_content, {
   register_flca_outputs("departments", department_net, "Department")
   register_flca_outputs("reference_flca", reference_author_journal_net, "Reference author and journal")
   register_flca_outputs("graphical_abstract_flca", graphical_abstract_net, "Graphical abstract keyword")
+
+  openalex_candidates <- reactiveVal(data.frame())
+  openalex_result <- reactiveVal(NULL)
+  openalex_notice <- reactiveVal("Enter an author name and OpenAlex API key, then search.")
+  openalex_key <- function() {
+    entered <- trimws(input$openalex_api_key %||% "")
+    if (nzchar(entered)) entered else Sys.getenv("OPENALEX_API_KEY", "")
+  }
+  openalex_flca <- function(net) {
+    if (!nrow(net$nodes) || !nrow(net$edges)) return(NULL)
+    tryCatch({
+      source("openalex_flca_ms_sil_module.R", local = TRUE)
+      nodes <- data.frame(name = net$nodes$term, value = net$nodes$frequency)
+      edges <- data.frame(Leader = net$edges$from, Follower = net$edges$to,
+                          WCD = net$edges$weight)
+      run_flca_ms_sil_runner(nodes, edges,
+        cfg = list(target_n = min(20L, nrow(nodes)), top_clusters = 5L,
+                   base_per_cluster = 4L, max_per_cluster = 4L), verbose = FALSE)
+    }, error = function(e) structure(list(message = e$message), class = "flca_error"))
+  }
+  load_openalex_author <- function(author_id) {
+    candidates <- openalex_candidates()
+    selected <- candidates[candidates$id == author_id, , drop = FALSE]
+    if (!nrow(selected)) return(invisible(NULL))
+    openalex_notice(paste("Loading works for", selected$name[1], "..."))
+    result <- tryCatch({
+      fetched <- oa_fetch_works(author_id, openalex_key(), max_works = 10000L)
+      list(id = author_id, name = selected$name[1], fetched = fetched,
+           data = oa_author_data(fetched$works, author_id, selected$name[1]),
+           profile = selected)
+    }, error = function(e) {
+      openalex_notice(conditionMessage(e))
+      NULL
+    })
+    openalex_result(result)
+    if (!is.null(result)) {
+      openalex_notice(sprintf("%s (%s): %d of %d OpenAlex works retrieved%s.",
+                              result$name, result$id, nrow(result$data$publications),
+                              result$fetched$total,
+                              if (result$fetched$truncated) " (latest 10,000 shown; some metrics unavailable)" else ""))
+    }
+    invisible(NULL)
+  }
+  observeEvent(input$search_openalex, {
+    openalex_result(NULL)
+    candidates <- tryCatch(oa_search_authors(input$openalex_author_name %||% "", openalex_key()),
+                           error = function(e) {
+                             openalex_notice(conditionMessage(e))
+                             NULL
+                           })
+    if (is.null(candidates)) return()
+    openalex_candidates(candidates)
+    updateTabsetPanel(session, "main_tabs", selected = "OpenAlex authors")
+    if (!nrow(candidates)) {
+      openalex_notice("No OpenAlex author profiles matched this name.")
+      updateSelectInput(session, "openalex_author_id", choices = character())
+      return()
+    }
+    choices <- stats::setNames(candidates$id,
+      sprintf("%s — %s — h-index %s, %d works (%s)", candidates$name,
+              ifelse(nzchar(candidates$institution), candidates$institution, "institution unknown"),
+              ifelse(is.na(candidates$h_index), "N/A", candidates$h_index),
+              candidates$works, candidates$id))
+    updateSelectInput(session, "openalex_author_id", choices = choices, selected = candidates$id[1])
+    load_openalex_author(candidates$id[1])
+  })
+  observeEvent(input$openalex_author_id, {
+    selected_id <- input$openalex_author_id %||% ""
+    current <- openalex_result()
+    if (nzchar(selected_id) && (is.null(current) || !identical(current$id, selected_id)))
+      load_openalex_author(selected_id)
+  }, ignoreInit = TRUE)
+  output$openalex_author_status <- renderText(openalex_notice())
+  output$openalex_profile_link <- renderUI({
+    result <- openalex_result()
+    if (is.null(result)) return(NULL)
+    tags$p("Selected OpenAlex ID: ", tags$strong(result$id), " · ",
+           tags$a("View profile", href = paste0("https://openalex.org/", result$id),
+                  target = "_blank", rel = "noopener noreferrer"))
+  })
+  output$openalex_candidates <- renderTable({
+    candidates <- openalex_candidates()
+    if (!nrow(candidates)) return(NULL)
+    names(candidates) <- c("OpenAlex ID", "Author", "Works", "Citations", "h-index", "Institution", "ORCID")
+    candidates
+  }, striped = TRUE, bordered = TRUE)
+  output$openalex_publications <- renderTable({
+    result <- openalex_result()
+    if (is.null(result) || !nrow(result$data$publications)) return(NULL)
+    utils::head(result$data$publications[, c("Year", "Title", "Citations", "FocalRole", "Corresponding", "Coauthors", "DOI")], 30)
+  }, striped = TRUE, bordered = TRUE)
+  output$openalex_coauthors <- renderTable({
+    result <- openalex_result()
+    if (is.null(result) || !nrow(result$data$authors)) return(NULL)
+    coauthors <- result$data$authors[result$data$authors$id != result$id, , drop = FALSE]
+    names(coauthors) <- c("OpenAlex ID", "Author", "Shared publications", "Citations on shared works",
+                           "First-author works", "Last-author works", "Corresponding-author works")
+    utils::head(coauthors, 30)
+  }, striped = TRUE, bordered = TRUE)
+  openalex_analysis <- reactive({
+    result <- openalex_result()
+    if (is.null(result)) return(NULL)
+    oa_first_last_analysis(result$fetched$works, result$id, result$fetched$total,
+                           !result$fetched$truncated, openalex_flca)
+  })
+  openalex_metric_values <- reactive({
+    analysis <- openalex_analysis()
+    result <- openalex_result()
+    if (is.null(analysis) || is.null(result)) return(NULL)
+    values <- analysis$metrics
+    values <- c(values["AAC"], values["SHC"], values["CLI"],
+                `h-index` = result$profile$h_index[1], values["MAR"],
+                values["n"], `n*` = values["n_star"])
+    names(values) <- c("AAC", "SHC", "CLI", "h-index", "MAR", "n", "n*")
+    vapply(seq_along(values), function(i) {
+      value <- values[i]
+      shown <- if (!is.finite(value)) "N/A" else if (i >= 6L || i == 4L)
+        formatC(value, format = "f", digits = 0) else formatC(value, format = "f", digits = 3)
+      if (i == 7L && !analysis$complete) shown <- paste0("≥", shown)
+      shown
+    }, character(1)) |> stats::setNames(names(values))
+  })
+  openalex_aac_note <- reactive({
+    analysis <- openalex_analysis()
+    if (is.null(analysis)) return("")
+    top <- analysis$top_counts
+    if (!analysis$complete || length(top) < 3L) return("AAC unavailable: fewer than three FLCA node counts or an incomplete work fetch.")
+    sprintf("FLCA role-count AAC: v1=%d, v2=%d, v3=%d; AAC=%.3f. AAC = [(v1/v2)/(v2/v3)] / [1+(v1/v2)/(v2/v3)].",
+            top[1], top[2], top[3], analysis$metrics["AAC"])
+  })
+  output$openalex_node_measures <- renderTable({
+    analysis <- openalex_analysis()
+    if (is.null(analysis)) return(NULL)
+    d <- analysis$nodes[, c("name", "cluster", "role_works", "edge_count", "shc")]
+    names(d) <- c("Author", "FLCA cluster", "First/last works", "Edge count", "SHC")
+    d
+  }, digits = 3, striped = TRUE, bordered = TRUE)
+  output$openalex_dendrogram_status <- renderText({
+    analysis <- openalex_analysis()
+    if (is.null(analysis)) return("Select an OpenAlex profile with first/last-author links.")
+    sprintf("FLCA retained %d nodes from %d linked candidates; the dendrogram displays %d strongest follower-to-leader links.",
+            nrow(analysis$flca_tree$modes), analysis$linked_candidates,
+            nrow(analysis$flca_tree$data))
+  })
+  output$openalex_dendrogram <- renderPlot({
+    analysis <- openalex_analysis()
+    if (is.null(analysis)) return(draw_message("Search OpenAlex to build the author dendrograph."))
+    labels <- stats::setNames(analysis$nodes$name, analysis$nodes$id)
+    leaders <- intersect(as.character(analysis$flca_tree$data$Leader), analysis$nodes$id)
+    pool <- if (length(leaders)) analysis$nodes[analysis$nodes$id %in% leaders, , drop = FALSE] else analysis$nodes
+    highlight <- pool$id[which.max(pool$role_works)]
+    net <- list(nodes = data.frame(term = analysis$nodes$id,
+                                   frequency = analysis$nodes$role_works))
+    draw_flca_dendrogram(analysis$flca_tree, net, "OpenAlex first/last authors",
+                         label_map = labels, highlight_id = highlight)
+  }, height = 850, res = 110)
+  output$openalex_network <- renderPlot({
+    analysis <- openalex_analysis()
+    result <- openalex_result()
+    if (is.null(result)) return(draw_message("Search OpenAlex to build the author network."))
+    if (is.null(analysis)) return(draw_message("At least one first/last-author link is needed."))
+    d <- analysis$nodes
+    n <- nrow(d)
+    d$angle <- 2 * pi * (seq_len(n) - 1) / n
+    d$x <- cos(d$angle); d$y <- sin(d$angle)
+    d$label_x <- 1.14 * d$x; d$label_y <- 1.14 * d$y
+    d$hjust <- ifelse(d$x > .15, 0, ifelse(d$x < -.15, 1, .5))
+    d$type <- ifelse(d$id == analysis$focal, "Selected author", "Other author")
+    edges <- analysis$edges
+    edges$x <- d$x[match(edges$from, d$id)]; edges$y <- d$y[match(edges$from, d$id)]
+    edges$xend <- d$x[match(edges$to, d$id)]; edges$yend <- d$y[match(edges$to, d$id)]
+    print(ggplot(d) +
+      geom_segment(data = edges, aes(x = x, y = y, xend = xend, yend = yend, linewidth = weight),
+                   inherit.aes = FALSE, colour = "#6b8fb3", alpha = .7) +
+      geom_point(aes(x = x, y = y, size = role_works, fill = type), shape = 21, colour = "#333333") +
+      geom_text(aes(x = label_x, y = label_y, label = paste0(name, " (", role_works, ")"), hjust = hjust),
+                size = 3.1, check_overlap = TRUE) +
+      scale_fill_manual(values = c("Selected author" = "#b2182b", "Other author" = "#2a9d8f"), guide = "none") +
+      scale_linewidth(range = c(.5, 4), guide = "none") + scale_size(range = c(3, 9), guide = "none") +
+      coord_equal(xlim = c(-1.7, 1.7), ylim = c(-1.5, 1.5), clip = "off") +
+      labs(title = "OpenAlex first/last-author FLCA network",
+           subtitle = paste("FLCA nodes from the works of", result$name, "; links join first and last authors.")) +
+      theme_void(base_size = 13) + theme(plot.title = element_text(face = "bold")))
+  })
+  output$openalex_kano <- renderPlot({
+    result <- openalex_result()
+    if (is.null(result)) return(draw_message("Search OpenAlex to build the coauthor Kano plot."))
+    analysis <- openalex_analysis()
+    if (is.null(analysis) || nrow(analysis$nodes) < 2L) return(draw_message("At least two first/last authors are needed for the Kano plot."))
+    d <- analysis$nodes
+    nodes <- data.frame(name = d$name, value = d$role_works, value2 = d$edge_count,
+                        carac = d$cluster, size_plot = ifelse(is.finite(d$shc), pmax(d$shc, .01), .01))
+    source("kano.R", local = TRUE)
+    plot <- plot_kano_real(nodes,
+                           title_txt = paste("Kano:", result$name), visual_ratio = 1)
+    plot <- plot + ggplot2::labs(x = "First/last-author edge occurrences among FLCA nodes",
+                                 y = "First/last-author work count", size = "SHC = 1 - Burt constraint",
+                                 subtitle = sprintf("%d FLCA nodes from %d OpenAlex works%s",
+                                                    nrow(d), length(result$fetched$works),
+                                                    if (analysis$complete) "" else " (partial fetch)"))
+    values <- openalex_metric_values()
+    colours <- c("#d62828", "#1565c0", "#21843a", "#7e22ce", "#e65c00", "#374151", "#374151")
+    grid::grid.newpage()
+    grid::pushViewport(grid::viewport(layout = grid::grid.layout(
+      nrow = 3L, ncol = 1L, heights = grid::unit(c(15, 8, 77), "null"))))
+    grid::pushViewport(grid::viewport(layout.pos.row = 1L))
+    for (i in seq_along(values)) {
+      x <- (i - .5) / length(values)
+      grid::grid.roundrect(x = x, y = .5, width = .94 / length(values), height = .83,
+                           r = grid::unit(5, "pt"),
+                           gp = grid::gpar(fill = "white", col = colours[i], lwd = 1.7))
+      grid::grid.text(names(values)[i], x = x, y = .68,
+                      gp = grid::gpar(col = colours[i], fontsize = 12, fontface = "bold"))
+      grid::grid.text(values[i], x = x, y = .33,
+                      gp = grid::gpar(col = "#111827", fontsize = 17, fontface = "bold"))
+    }
+    grid::popViewport()
+    grid::pushViewport(grid::viewport(layout.pos.row = 2L))
+    grid::grid.text(openalex_aac_note(), x = .015, y = .65, just = "left",
+                    gp = grid::gpar(col = "#222222", fontsize = 10))
+    grid::grid.text("Bubble size: SHC = 1 − Burt constraint on the displayed network.",
+                    x = .015, y = .22, just = "left",
+                    gp = grid::gpar(col = "#555555", fontsize = 10))
+    grid::popViewport()
+    print(plot, newpage = FALSE, vp = grid::viewport(layout.pos.row = 3L))
+    grid::popViewport()
+  })
+  output$download_openalex_publications <- downloadHandler(
+    filename = function() paste0("openalex_author_", if (is.null(openalex_result())) "works" else openalex_result()$id, ".csv"),
+    content = function(file) {
+      result <- openalex_result(); req(result)
+      readr::write_csv(result$data$publications, file, na = "")
+    }
+  )
 
   summary_data <- reactive({
     x <- data(); if(!nrow(x)) return(tibble())
